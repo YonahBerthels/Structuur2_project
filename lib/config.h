@@ -24,7 +24,10 @@
 const u_int16_t COLORS[] = { COLOR_RED, COLOR_GREEN, COLOR_BLUE, COLOR_YELLOW, COLOR_ORANGE };
 
 #define SELECTION_COLOR M5.Lcd.color565(255, 255, 255)
-#define SELECTION_WIDTH 2
+#define SELECTION_WIDTH 3
+
+#define NUM_OPTIONS 4
+const char* OPTIONS[] = { "BACK", "SAVE", "LOAD", "RESET LEVEL" };
 
 /* Definition of Gem struct 
 * type:         the color of the gem (RED, GREEN, BLUE, YELLOW, GREEN, ORANGE)
@@ -60,5 +63,8 @@ void draw_board(void);
 void init_gems(void);
 void init_game(Game*);
 void display_gamestate(void);
+void draw_thick_rectangle(u_int8_t, u_int8_t, u_int8_t , u_int8_t , u_int8_t , u_int16_t );
+
+void draw_option_screen(void);
 
 #endif /* CONFIG_H_ */
