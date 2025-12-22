@@ -1,0 +1,723 @@
+#include <M5Unified.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "EEPROM.h"
+#include "../lib/config.h"
+
+#define INDEX(row, col) (row * game.board_width + col)
+
+// Global game state
+Game game;
+bool options_showing = false;
+int selected_gem_idx = 2;
+int second_selected_idx = 3;
+bool is_horizontal = true;
+float acc_x, acc_y, acc_z;
+unsigned long last_move_time = 0;
+bool game_started = false;
+u_int8_t selected_variant = 0;
+static bool matches_buffer[MAX_BOARD_WIDTH * MAX_BOARD_HEIGHT];
+u_int8_t selected_option = 0;
+bool board_ready = false;
+
+void setup()
+{
+  M5.begin();
+  M5.Imu.init();
+  Serial.begin(115200);
+  M5.Lcd.fillScreen(BLACK);
+
+  /* RNG seed */
+  float sx, sy, sz;
+  if (M5.Imu.getAccelData(&sx, &sy, &sz) == 0)
+    srand(int(sx * 1000 + sy * 1000 + sz * 1000) & 0x7FFF);
+  else
+    srand(millis() & 0x7FFF);
+
+  game.gems = NULL;
+  /*  DO NOT call init_game() here any more  */
+}
+
+void init_game(Game *g, uint8_t level)
+{
+  g->level = level;
+  g->moves_left = 25;
+  if (level == 1)
+    g->score = 0;
+
+  g->board_width = 7;
+  g->board_height = 11 - level;
+  if (g->board_height < 3)
+    g->board_height = 3;
+
+  if (g->gems)
+  {
+    free(g->gems);
+    g->gems = NULL;
+  }
+  g->gems = (Gem *)calloc(g->board_width * g->board_height, sizeof(Gem));
+
+  /* 1. fill the board randomly */
+  init_gems();
+
+  /* 3. finally put the cursor in a known place */
+  selected_gem_idx = 0;
+  second_selected_idx = 1;
+  is_horizontal = true;
+  update_selection();
+}
+
+void draw_board(void)
+{
+  for (int i = 0; i < game.board_height * game.board_width; i++)
+  {
+    Gem g = game.gems[i];
+
+    u_int16_t color = BLACK;
+
+    if (g.type == GEM_EMPTY)
+    {
+      color = BLACK;
+    }
+    else if (g.type < NUM_GEM_TYPES)
+    {
+      color = COLORS[g.type];
+    }
+    else
+    {
+      // corrupted/invalid type -> draw as magenta to spot bugs fast
+      color = MAGENTA;
+    }
+
+    u_int8_t x = get_gem_x(i);
+    u_int8_t y = get_gem_y(i);
+
+    M5.Lcd.fillRect(x, y, GEM_SIZE, GEM_SIZE, color);
+
+    if (g.is_selected)
+      draw_thick_rectangle(x, y, GEM_SIZE, GEM_SIZE, SELECTION_WIDTH, SELECTION_COLOR);
+  }
+}
+
+void update_selection()
+{
+  for (int i = 0; i < game.board_height * game.board_width; i++)
+  {
+    game.gems[i].is_selected = false;
+  }
+
+  game.gems[selected_gem_idx].is_selected = true;
+  game.gems[second_selected_idx].is_selected = true;
+}
+
+void rotate_cursor()
+{
+  int row = selected_gem_idx / game.board_width;
+  int col = selected_gem_idx % game.board_width;
+
+  if (is_horizontal)
+  {
+    if (row < game.board_height - 1)
+    {
+      second_selected_idx = selected_gem_idx + game.board_width;
+      is_horizontal = false;
+    }
+  }
+  else
+  {
+    if (col < game.board_width - 1)
+    {
+      second_selected_idx = selected_gem_idx + 1;
+      is_horizontal = true;
+    }
+  }
+
+  update_selection();
+}
+
+void swap_gems()
+{
+  uint8_t t = game.gems[selected_gem_idx].type;
+  game.gems[selected_gem_idx].type = game.gems[second_selected_idx].type;
+  game.gems[second_selected_idx].type = t;
+
+  game.moves_left--;
+
+  if (game.version == 0) {
+    handle_matches(true);
+  } else {
+    bool matches[MAX_BOARD_WIDTH * MAX_BOARD_HEIGHT];
+    if (find_matches(matches)) {
+      handle_matches(true);
+    } else {
+      // swap back
+      t = game.gems[selected_gem_idx].type;
+      game.gems[selected_gem_idx].type = game.gems[second_selected_idx].type;
+      game.gems[second_selected_idx].type = t;
+      game.moves_left++;
+    }
+  }
+
+  update_selection();
+}
+
+
+void move_selection(float acc_x, float acc_y)
+{
+  unsigned long now = millis();
+  if (now - last_move_time < MOVE_DELAY)
+    return;
+
+  int row = selected_gem_idx / game.board_width;
+  int col = selected_gem_idx % game.board_width;
+
+  int new_row = row;
+  int new_col = col;
+  bool moved = false;
+
+  if (acc_x > MIN_TILT)
+  {
+    if (col > 0)
+    {
+      new_col--;
+      moved = true;
+    }
+  }
+  else if (acc_x < -MIN_TILT)
+  {
+    int max_col = is_horizontal ? game.board_width - 2 : game.board_width - 1;
+    if (col < max_col)
+    {
+      new_col++;
+      moved = true;
+    }
+  }
+
+  if (acc_y > MIN_TILT)
+  {
+    int max_row = is_horizontal ? game.board_height - 1 : game.board_height - 2;
+    if (row < max_row)
+    {
+      new_row++;
+      moved = true;
+    }
+  }
+  else if (acc_y < -MIN_TILT)
+  {
+    if (row > 0)
+    {
+      new_row--;
+      moved = true;
+    }
+  }
+
+  if (moved)
+  {
+    selected_gem_idx = new_row * game.board_width + new_col;
+
+    if (is_horizontal)
+    {
+      if (new_col == game.board_width - 1)
+        second_selected_idx = selected_gem_idx - 1;
+      else
+        second_selected_idx = selected_gem_idx + 1;
+    }
+    else
+    {
+      if (new_row == game.board_height - 1)
+        second_selected_idx = selected_gem_idx - game.board_width;
+      else
+        second_selected_idx = selected_gem_idx + game.board_width;
+    }
+
+    update_selection();
+    last_move_time = now;
+  }
+}
+
+u_int8_t get_gem_x(int index)
+{
+  int col = index % game.board_width;
+  return X_OFFSET + (col * GEM_SIZE);
+}
+
+u_int8_t get_gem_y(int index)
+{
+  int row = index / game.board_width;
+  return Y_OFFSET + (row * GEM_SIZE);
+}
+
+bool find_matches(bool *matches)
+{
+  for (int i = 0; i < game.board_width * game.board_height; i++)
+    matches[i] = false;
+
+  bool found_h = find_horizontal_matches(matches);
+  bool found_v = find_vertical_matches(matches);
+
+  return found_h || found_v;
+}
+
+bool find_horizontal_matches(bool *matches)
+{
+  bool found = false;
+
+  for (int r = 0; r < game.board_height; ++r)
+  {
+    int run = 1;
+
+    for (int c = 1; c < game.board_width; ++c)
+    {
+      uint8_t cur = game.gems[INDEX(r, c)].type;
+      uint8_t prv = game.gems[INDEX(r, c - 1)].type;
+
+      if (cur == prv && cur != GEM_EMPTY)
+      {
+        ++run;
+      }
+      else
+      {
+        if (run >= 3)
+        {
+          found = true;
+          for (int k = 0; k < run; ++k)
+            matches[INDEX(r, c - 1 - k)] = true;
+        }
+        run = 1;
+      }
+    }
+    if (run >= 3)
+    {
+      found = true;
+      for (int k = 0; k < run; ++k)
+        matches[INDEX(r, game.board_width - 1 - k)] = true;
+    }
+  }
+  return found;
+}
+
+bool find_vertical_matches(bool *matches)
+{
+  bool found = false;
+
+  for (int c = 0; c < game.board_width; ++c)
+  {
+    int run = 1;
+
+    for (int r = 1; r < game.board_height; ++r)
+    {
+      uint8_t cur = game.gems[INDEX(r, c)].type;
+      uint8_t prv = game.gems[INDEX(r - 1, c)].type;
+
+      if (cur == prv && cur != GEM_EMPTY)
+      {
+        ++run;
+      }
+      else
+      {
+        if (run >= 3)
+        {
+          found = true;
+          for (int k = 0; k < run; ++k)
+            matches[INDEX(r - 1 - k, c)] = true;
+        }
+        run = 1;
+      }
+    }
+    if (run >= 3)
+    {
+      found = true;
+      for (int k = 0; k < run; ++k)
+        matches[INDEX(game.board_height - 1 - k, c)] = true;
+    }
+  }
+  return found;
+}
+
+void move_gems_down(void)
+{
+  for (int c = 0; c < game.board_width; ++c) /* per column */
+  {
+    int write = game.board_height - 1; /* bottommost free slot */
+
+    /* copy existing gems down */
+    for (int r = game.board_height - 1; r >= 0; --r)
+    {
+      if (game.gems[INDEX(r, c)].type != GEM_EMPTY)
+      {
+        if (write != r) /* only copy if needed */
+          game.gems[INDEX(write, c)] = game.gems[INDEX(r, c)];
+        game.gems[INDEX(write, c)].is_selected = false;
+        --write;
+      }
+    }
+    /* fill holes at top with new random gems */
+    while (write >= 0)
+    {
+      game.gems[INDEX(write, c)].type = rand() % NUM_GEM_TYPES;
+      game.gems[INDEX(write, c)].is_selected = false;
+      --write;
+    }
+  }
+}
+
+void handle_matches(bool is_user_move)
+{
+  bool found_matches;
+
+  do
+  {
+    found_matches = find_matches(matches_buffer);
+
+    if (found_matches)
+    {
+      // DEBUG: show what was found BEFORE removing
+      M5.Lcd.clear();
+      draw_board();
+      debug_draw_matches(matches_buffer);
+      delay(600);                 // long enough to see it
+
+      remove_matches(matches_buffer, is_user_move);
+      move_gems_down();
+    }
+  } while (found_matches);
+
+  if (is_user_move)
+  {
+    check_level_up();
+  }
+}
+
+
+/* ------------------------------------------------------------------ */
+/* 1.  turn every marked gem into empty slot                          */
+/* ------------------------------------------------------------------ */
+void remove_matches(bool *marks, bool player_move)
+{
+  for (int i = 0; i < game.board_width * game.board_height; ++i)
+  {
+    if (marks[i])
+    {
+      game.gems[i].type = GEM_EMPTY;
+      if (player_move)
+        game.score += GEM_VALUE;
+    }
+  }
+}
+
+void check_level_up()
+{
+  // Calculate target based on TOTAL matches needed per level
+  int target_score = game.level * MATCHES_PER_LEVEL * GEM_VALUE;
+
+  if (game.score >= target_score)
+  {
+    int next_height = 11 - (game.level + 1);
+
+    if (next_height < 3)
+    {
+      show_victory_screen();
+    }
+    else
+    {
+      // Level up!
+      game.level++;
+      game.moves_left = 25; // Reset moves for new level
+
+      // Show transition message
+      M5.Lcd.fillScreen(GREEN);
+      M5.Lcd.setTextColor(WHITE);
+      M5.Lcd.setTextSize(2);
+      M5.Lcd.drawCenterString("LEVEL UP!", M5.Lcd.width() / 2, 100);
+      M5.Lcd.setTextSize(1);
+      M5.Lcd.drawCenterString(String("Level ") + String(game.level), M5.Lcd.width() / 2, 140);
+      delay(2000);
+
+      // Reinitialize board WITHOUT resetting score
+      int temp_score = game.score;
+      init_game(&game, game.level);
+      game.score = temp_score; // Preserve score across levels
+
+      M5.Lcd.fillScreen(BLACK);
+    }
+  }
+}
+
+void show_victory_screen()
+{
+  M5.Lcd.fillScreen(BLUE);
+  M5.Lcd.setTextColor(WHITE);
+  M5.Lcd.setTextSize(3);
+  M5.Lcd.drawCenterString("YOU WIN!", M5.Lcd.width() / 2, 80);
+
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.drawCenterString(String("Final Score: ") + String(game.score), M5.Lcd.width() / 2, 150);
+  M5.Lcd.drawCenterString("Press A+B to Restart", M5.Lcd.width() / 2, 180);
+
+  while (true)
+  {
+    M5.update();
+    if (M5.BtnA.wasPressed() && M5.BtnB.wasPressed())
+    {
+      game.score = 0;
+      init_game(&game, 1);
+      return;
+    }
+    delay(10);
+  }
+}
+
+void execute_menu_option(void)
+{
+  switch (selected_option)
+  {
+  case 0:
+    options_showing = false;
+    break;
+  case 1:
+    save_to_eeprom();
+    break;
+  case 2:
+    load_from_eeprom();
+    break;
+  case 3:
+    game.score = 0;
+    init_game(&game, game.level);
+    selected_gem_idx = 0;
+    second_selected_idx = 1;
+    is_horizontal = true;
+    update_selection();
+    options_showing = false;
+    break;
+  }
+}
+
+void init_gems(void)
+{
+  bool has_matches;
+  do
+  {
+    for (int r = 0; r < game.board_height; r++)
+    {
+      for (int c = 0; c < game.board_width; c++)
+      {
+        game.gems[INDEX(r, c)].type = rand() % NUM_GEM_TYPES;
+        game.gems[INDEX(r, c)].is_selected = false;
+      }
+    }
+    has_matches = find_matches(matches_buffer);
+
+    /* let us watch the board being sanitised */
+    M5.Lcd.clear();
+    draw_board();
+    delay(50); // 50 ms is enough to see it
+  } while (has_matches);
+}
+
+void draw_thick_rectangle(u_int8_t x_top, u_int8_t y_top, u_int8_t width, u_int8_t height, u_int8_t thickness, u_int16_t color)
+{
+  for (int i = 0; i < thickness; i++)
+  {
+    M5.Lcd.drawRect(x_top + i, y_top + i, width - 2 * i, height - 2 * i, color);
+  }
+}
+
+void display_gamestate(void)
+{
+  M5.Lcd.setCursor(X_OFFSET, M5.Lcd.height() - 35);
+  M5.Lcd.printf("Level: %d  Moves: %d\n", game.level, game.moves_left);
+  M5.Lcd.setCursor(X_OFFSET, M5.Lcd.height() - 25);
+  M5.Lcd.printf("Score: %d\n", game.score);
+}
+
+void draw_option_screen(void)
+{
+  const u_int8_t y_offsets[] = {Y_OFFSET, Y_OFFSET + 20, Y_OFFSET + 40, Y_OFFSET + 60};
+
+  for (int i = 0; i < NUM_OPTIONS; i++)
+  {
+    M5.Lcd.setCursor(X_OFFSET, y_offsets[i]);
+
+    u_int16_t color = (i == selected_option) ? RED : WHITE;
+    M5.Lcd.setTextColor(color);
+
+    M5.Lcd.printf("%s\n", OPTIONS[i]);
+  }
+}
+
+u_int8_t encode_gem(Gem g)
+{
+  u_int8_t encoded = g.type;
+  if (g.is_selected)
+  {
+    encoded |= (1 << 7);
+  }
+  return encoded;
+}
+
+Gem decode_gem(u_int8_t data)
+{
+  Gem g;
+  g.is_selected = (data >> 7) & 1;
+  g.type = data & 0x7F;
+  return g;
+}
+
+void save_to_eeprom(void)
+{
+  EEPROM.begin(MEM_SIZE);
+  EEPROM.write(0, game.version);
+  EEPROM.write(1, game.level);
+  EEPROM.write(2, game.moves_left);
+  EEPROM.write(3, game.score);
+  EEPROM.write(4, game.board_width);
+  EEPROM.write(5, game.board_height);
+  EEPROM.write(6, (u_int8_t)selected_gem_idx);
+  EEPROM.write(7, (u_int8_t)second_selected_idx);
+  EEPROM.write(8, (u_int8_t)is_horizontal);
+
+  int total_gems = game.board_width * game.board_height;
+  for (int i = 0; i < total_gems; i++)
+  {
+    EEPROM.write(9 + i, encode_gem(game.gems[i]));
+  }
+
+  EEPROM.commit();
+  EEPROM.end();
+}
+
+void load_from_eeprom()
+{
+  EEPROM.begin(MEM_SIZE);
+
+  game.version = EEPROM.read(0);
+  game.level = EEPROM.read(1);
+  game.moves_left = EEPROM.read(2);
+  game.score = EEPROM.read(3);
+  game.board_width = EEPROM.read(4);
+  game.board_height = EEPROM.read(5);
+  selected_gem_idx = EEPROM.read(6);
+  second_selected_idx = EEPROM.read(7);
+  is_horizontal = (bool)EEPROM.read(8);
+
+  if (game.gems != NULL)
+    free(game.gems);
+  game.gems = (Gem *)calloc((game.board_height * game.board_width), sizeof(Gem));
+
+  int total_gems = game.board_width * game.board_height;
+  for (int i = 0; i < total_gems; i++)
+  {
+    game.gems[i] = decode_gem(EEPROM.read(9 + i));
+  }
+
+  EEPROM.end();
+}
+
+void draw_start_screen()
+{
+  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.setTextColor(WHITE);
+  M5.Lcd.setTextSize(2);
+  M5.Lcd.drawCenterString("BEJEWELED", M5.Lcd.width() / 2, 40);
+
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setCursor(M5.Lcd.width() / 2 - 60, 100);
+
+  if (selected_variant == 0)
+    M5.Lcd.setTextColor(YELLOW);
+  else
+    M5.Lcd.setTextColor(WHITE);
+  M5.Lcd.println("FREE SWAPS");
+
+  M5.Lcd.setCursor(M5.Lcd.width() / 2 - 60, 130);
+  if (selected_variant == 1)
+    M5.Lcd.setTextColor(YELLOW);
+  else
+    M5.Lcd.setTextColor(WHITE);
+  M5.Lcd.println("ONLY VALID SWAPS");
+
+  M5.Lcd.setTextColor(WHITE);
+  M5.Lcd.drawCenterString("A: Toggle  B: Start", M5.Lcd.width() / 2, 200);
+}
+
+void loop()
+{
+  M5.update();
+  delay(150);
+
+  if (!game_started)
+  {
+    if (M5.BtnA.wasPressed())
+    {
+      selected_variant = (selected_variant == 0) ? 1 : 0;
+    }
+    if (M5.BtnB.wasPressed())
+    {
+      game.version = selected_variant;
+
+      init_game(&game, 1);
+      board_ready = true;
+
+      game_started = true;
+      M5.Lcd.fillScreen(BLACK);
+    }
+    draw_start_screen();
+    return;
+  }
+
+  if (!board_ready)
+    return;
+
+  if (M5.BtnB.wasPressed() && M5.BtnA.wasPressed())
+  {
+    options_showing = !options_showing;
+    if (!options_showing)
+      selected_option = 0;
+  }
+  if (options_showing && M5.BtnA.wasPressed())
+  {
+    selected_option = (selected_option + 1) % NUM_OPTIONS;
+  }
+  if (M5.BtnB.wasClicked())
+  {
+    execute_menu_option();
+  }
+
+  if (options_showing)
+  {
+    draw_option_screen();
+    return;
+  }
+
+  if (M5.BtnA.wasPressed())
+  {
+    rotate_cursor();
+  }
+  if (M5.BtnB.wasPressed())
+  {
+    swap_gems();
+  }
+  M5.Imu.getAccelData(&acc_x, &acc_y, &acc_z);
+  move_selection(acc_x, acc_y);
+
+  M5.Lcd.clear();
+  draw_board();
+
+  bool dbg[MAX_BOARD_WIDTH * MAX_BOARD_HEIGHT];
+  find_matches(dbg);
+  debug_draw_matches(dbg);
+  display_gamestate();
+}
+
+void debug_draw_matches(bool *marks)
+{
+  for (int i = 0; i < game.board_width * game.board_height; i++)
+  {
+    if (!marks[i])
+      continue;
+    u_int8_t x = get_gem_x(i);
+    u_int8_t y = get_gem_y(i);
+    // small white dot in the center
+    M5.Lcd.fillCircle(x + GEM_SIZE / 2, y + GEM_SIZE / 2, 2, WHITE);
+  }
+}
