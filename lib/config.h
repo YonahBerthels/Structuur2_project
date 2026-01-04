@@ -34,7 +34,7 @@ const u_int16_t COLORS[] = {RED, GREEN, BLUE, YELLOW, ORANGE, PINK, PURPLE, CYAN
 const char *OPTIONS[] = {"BACK", "SAVE", "LOAD", "RESET LEVEL"};
 
 /* Definition of Gem struct
- * type:         the color of the gem
+ * type:         the color of the gem (or EMPTY)
  * is_selected:  is this gem part of the cursor?
  */
 typedef struct gem
@@ -74,13 +74,14 @@ void draw_thick_rectangle(u_int8_t, u_int8_t, u_int8_t, u_int8_t, u_int8_t, u_in
 void draw_option_screen(void);
 u_int8_t get_gem_x(int index);
 u_int8_t get_gem_y(int index);
+int gem_idx(int col, int row);
 
 void update_selection(void);
 void rotate_cursor(void);
 void swap_gems(void);
 
 bool find_matches(bool *matches);
-
+ void clear_marks(bool *marks);
 void remove_matches(bool *matches, bool is_user_move);
 void move_gems_down(void);
 void handle_matches(bool is_user_move);
@@ -98,8 +99,5 @@ Gem decode_gem(u_int8_t encoded);
 
 void move_selection(float acc_x, float acc_y);
 void draw_start_screen(void);
-
-static void clear_marks(bool *marks);
-static int idx_rc(int r, int c);
 
 #endif /* CONFIG_H_ */

@@ -4,11 +4,11 @@
 #include "EEPROM.h"
 #include "../lib/config.h"
 
-#define INDEX(row, col) ((row) * game.board_width + (col))
-
+// temporary boolean mask used to mark gems that are part of a match (gets "cleaned" and reused)
+// static so just initted once
 static bool matches_buffer[MAX_BOARD_WIDTH * MAX_BOARD_HEIGHT];
 
-// Global game state
+// Global game variable + other variables
 Game game;
 bool options_showing = false;
 int selected_gem_idx = 0;
@@ -20,6 +20,7 @@ bool game_started = false;
 uint8_t selected_variant = 0;
 uint8_t selected_option = 0;
 bool board_ready = false;
+float sx, sy, sz;
 
 void setup()
 {
@@ -29,17 +30,14 @@ void setup()
   Serial.flush();
   M5.Lcd.fillScreen(BLACK);
 
-  // RNG seed
-  float sx, sy, sz;
-  if (M5.Imu.getAccelData(&sx, &sy, &sz) == 0)
-    srand(int(sx * 1000 + sy * 1000 + sz * 1000) & 0x7FFF);
-  else
-    srand(millis() & 0x7FFF);
+  // seed random generator
+  srand(time(NULL));
 
-  // set gems to NULL as safety measure
+  // init gems as NULL just to be sure
   game.gems = NULL;
 }
 
+// init game
 void init_game(Game *g, uint8_t level)
 {
   g->level = level;
@@ -49,8 +47,7 @@ void init_game(Game *g, uint8_t level)
 
   g->board_width = 7;
   g->board_height = 11 - level;
-  if (g->board_height < 3)
-    g->board_height = 3;
+  // no need to check for negative sizes ect since the game ends once the user has completed the level with height of 3
 
   if (g->gems)
   {
@@ -58,13 +55,10 @@ void init_game(Game *g, uint8_t level)
     g->gems = NULL;
   }
 
+  // dynamically allocate an array for the gems based on current level size
+  // this array in freed in the code above to prepare for a new level with different dimensions
+  // max size = 8 x 11 x sizeof(Gem) ()
   g->gems = (Gem *)calloc(g->board_width * g->board_height, sizeof(Gem));
-  if (!g->gems)
-  {
-    Serial.println("calloc failed");
-    while (true)
-      delay(100);
-  }
 
   // choose random number of colors per level (part of assignment)
   int max_color = 8;
@@ -77,6 +71,8 @@ void init_game(Game *g, uint8_t level)
 
   selected_gem_idx = 0;
   second_selected_idx = 1;
+
+  // start the cursor horizontally
   is_horizontal = true;
   update_selection();
 }
@@ -93,12 +89,15 @@ u_int8_t get_gem_y(int index)
   return Y_OFFSET + (row * GEM_SIZE);
 }
 
+// function to draw the border around 2 gems. Representation of the cursor
 void draw_thick_rectangle(u_int8_t x_top, u_int8_t y_top, u_int8_t width, u_int8_t height, u_int8_t thickness, u_int16_t color)
 {
   for (int i = 0; i < thickness; i++)
     M5.Lcd.drawRect(x_top + i, y_top + i, width - 2 * i, height - 2 * i, color);
 }
 
+// simple function to draw the cells on the board
+// the x and y coordinates are based off of GEM_SIZE + GEM_OFFSET + index to preserve size so these values don't need to be stored as members of the struct
 void draw_board(void)
 {
   int total = game.board_width * game.board_height;
@@ -122,6 +121,7 @@ void draw_board(void)
   }
 }
 
+// small text to show the game state to the usre
 void display_gamestate(void)
 {
   M5.Lcd.setTextColor(WHITE);
@@ -170,82 +170,58 @@ void rotate_cursor()
 }
 
 // move cursor
-// usage of accelerometer based on WPO
-// millis() and other 'time related' code based on years of experience working with microcontrollers such as Arduino 
+// usage of accelerometer based on WPO 9 (exercise 4 - 5)
 void move_selection(float ax, float ay)
 {
-  unsigned long now = millis();
-  if (now - last_move_time < MOVE_DELAY)
-    return;
-
   int row = selected_gem_idx / game.board_width;
   int col = selected_gem_idx % game.board_width;
 
-  int new_row = row;
-  int new_col = col;
-  bool moved = false;
-
   if (ax > MIN_TILT)
   {
-    if (col > 0)
-    {
-      new_col--;
-      moved = true;
-    }
+    col -= 1;
   }
   else if (ax < -MIN_TILT)
   {
-    int max_col = is_horizontal ? game.board_width - 2 : game.board_width - 1;
-    if (col < max_col)
-    {
-      new_col++;
-      moved = true;
-    }
+    col += 1;
   }
 
   if (ay > MIN_TILT)
   {
-    int max_row = is_horizontal ? game.board_height - 1 : game.board_height - 2;
-    if (row < max_row)
-    {
-      new_row++;
-      moved = true;
-    }
+    row += 1;
   }
   else if (ay < -MIN_TILT)
   {
-    if (row > 0)
-    {
-      new_row--;
-      moved = true;
-    }
+    row -= 1;
   }
 
-  if (!moved)
-    return;
+  if (col < 0)
+    col = game.board_width - 1;
+  if (col >= game.board_width)
+    col = 0;
+  if (row < 0)
+    row = game.board_height - 1;
+  if (row >= game.board_height)
+    row = 0;
 
-  selected_gem_idx = new_row * game.board_width + new_col;
+  selected_gem_idx = row * game.board_width + col;
 
   if (is_horizontal)
   {
-    if (new_col == game.board_width - 1)
+    second_selected_idx = selected_gem_idx + 1;
+    if ((second_selected_idx % game.board_width) == 0)
       second_selected_idx = selected_gem_idx - 1;
-    else
-      second_selected_idx = selected_gem_idx + 1;
   }
   else
   {
-    if (new_row == game.board_height - 1)
+    second_selected_idx = selected_gem_idx + game.board_width;
+    if (second_selected_idx >= game.board_width * game.board_height)
       second_selected_idx = selected_gem_idx - game.board_width;
-    else
-      second_selected_idx = selected_gem_idx + game.board_width;
   }
 
   update_selection();
-  last_move_time = now;
 }
 
-static void clear_marks(bool *marks)
+void clear_marks(bool *marks)
 {
   int total = game.board_width * game.board_height;
   int i;
@@ -253,93 +229,107 @@ static void clear_marks(bool *marks)
     marks[i] = false;
 }
 
-static int idx_rc(int r, int c)
+int gem_idx(int r, int c)
 {
   return r * game.board_width + c;
 }
 
 // Returns true if any matches found; marks all matched cells in marks[]
-bool find_matches(bool *marks)
+// usage of boolean array to separate concerns: first we scan and mark cells for deletion, after scan is complete they are deleted
+bool find_matches(bool *to_remove)
 {
-  int W = game.board_width;
-  int H = game.board_height;
-  bool any = false;
+  bool match_found = false;
 
-  clear_marks(marks);
+  clear_marks(to_remove);
 
-  // check for vertical matches
+  // horizontal scan
+  for (int row = 0; row < game.board_height; row++)
   {
-    int r;
-    for (r = 0; r < H; r++)
+    int col = 0;
+
+    while (col < game.board_width)
     {
-      int c = 0;
-      while (c < W)
+      uint8_t current_type = game.gems[gem_idx(row, col)].type;
+
+      // skip gems that are already marked for removal
+      if (current_type == GEM_EMPTY)
       {
-        uint8_t t = game.gems[idx_rc(r, c)].type;
-        if (t == GEM_EMPTY)
-        {
-          c++;
-          continue;
-        }
-
-        /* extend run */
-        {
-          int start = c;
-          while ((c + 1) < W && game.gems[idx_rc(r, c + 1)].type == t)
-            c++;
-
-          if ((c - start + 1) >= 3)
-          {
-            int k;
-            any = true;
-            for (k = start; k <= c; k++)
-              marks[idx_rc(r, k)] = true;
-          }
-        }
-
-        c++;
+        col++;
+        continue;
       }
+
+      // start the run
+      int run_start_col = col;
+
+      while (col + 1 < game.board_width &&
+             game.gems[gem_idx(row, col + 1)].type == current_type)
+      {
+        col++;
+      }
+
+      int run_length = col - run_start_col + 1;
+
+      // run > 3 -> match found and mark for removal
+      if (run_length >= 3)
+      {
+        match_found = true;
+
+        for (int mark_col = run_start_col; mark_col <= col; mark_col++)
+        {
+          to_remove[gem_idx(row, mark_col)] = true;
+        }
+      }
+
+      col++;
     }
   }
 
-  // check for horizontal matches
+  // vertical scan
+  for (int col = 0; col < game.board_width; col++)
   {
-    int c;
-    for (c = 0; c < W; c++)
+    int row = 0;
+
+    while (row < game.board_height)
     {
-      int r = 0;
-      while (r < H)
+      uint8_t current_type = game.gems[gem_idx(row, col)].type;
+
+      if (current_type == GEM_EMPTY)
       {
-        uint8_t t = game.gems[idx_rc(r, c)].type;
-        if (t == GEM_EMPTY)
-        {
-          r++;
-          continue;
-        }
-
-        /* extend run */
-        {
-          int start = r;
-          while ((r + 1) < H && game.gems[idx_rc(r + 1, c)].type == t)
-            r++;
-
-          if ((r - start + 1) >= 3)
-          {
-            int k;
-            any = true;
-            for (k = start; k <= r; k++)
-              marks[idx_rc(k, c)] = true;
-          }
-        }
-
-        r++;
+        row++;
+        continue;
       }
+
+      // Start of a potential vertical run
+      int run_start_row = row;
+
+      // Extend run downward
+      while (row + 1 < game.board_height &&
+             game.gems[gem_idx(row + 1, col)].type == current_type)
+      {
+        row++;
+      }
+
+      int run_length = row - run_start_row + 1;
+
+      // run > 3 -> match found and mark for removal
+      if (run_length >= 3)
+      {
+        match_found = true;
+
+        for (int mark_row = run_start_row; mark_row <= row; mark_row++)
+        {
+          to_remove[gem_idx(mark_row, col)] = true;
+        }
+      }
+
+      row++;
     }
   }
 
-  return any;
+  return match_found;
 }
 
+// mark "real" board gems for deletoin (empty value) + update score
 void remove_matches(bool *marks, bool player_move)
 {
   int total = game.board_width * game.board_height;
@@ -355,39 +345,39 @@ void remove_matches(bool *marks, bool player_move)
   }
 }
 
-// move gems down after deletion of underlying gems
+// move gems down after deletion of underlying gems: "gravity" effect
 void move_gems_down(void)
 {
-  int width = game.board_width;
-  int height = game.board_height;
-
-  for (int col = 0; col < width; col++)
+  for (int col = 0; col < game.board_width; col++)
   {
-    int write_r = height - 1;
+    // new gems will appear in the top row
+    int write_row = game.board_height - 1;
 
     // move a row
-    for (int row = height - 1; row >= 0; row--)
+    for (int row = game.board_height - 1; row >= 0; row--)
     {
-      uint8_t t = game.gems[idx_rc(row, col)].type;
+      uint8_t t = game.gems[gem_idx(row, col)].type;
       if (t != GEM_EMPTY)
       {
-        if (write_r != row)
-          game.gems[idx_rc(write_r, col)].type = t;
-        write_r--;
+        if (write_row != row)
+          game.gems[gem_idx(write_row, col)].type = t;
+        write_row--;
       }
     }
 
     // fill top cells
-    while (write_r >= 0)
+    while (write_row >= 0)
     {
-      game.gems[idx_rc(write_r, col)].type = (uint8_t)(rand() % game.num_colors);
-      write_r--;
+      game.gems[gem_idx(write_row, col)].type = (uint8_t)(rand() % game.num_colors);
+      write_row--;
     }
   }
 
   update_selection();
 }
 
+// handle a match
+// the boolean parameter is a remnant of a previous version, but is kept for safety -> if loading from EEPROM somehow produces a match, it is not counted towards the user's score
 void handle_matches(bool is_user_move)
 {
   bool found;
@@ -406,33 +396,38 @@ void handle_matches(bool is_user_move)
     check_level_up();
 }
 
-static void swap_types(int a, int b)
+// only swap the types of a gem to prevent moving the cursor any only swaps types. The cursor should stay the same since we are using 2 "state" variables which would need to get updated too etc.
+void swap_types(int a, int b)
 {
   uint8_t t = game.gems[a].type;
   game.gems[a].type = game.gems[b].type;
   game.gems[b].type = t;
 }
 
+// swap 2 gems
 void swap_gems(void)
 {
+  // this buffer is only used in "valid only" mode
   bool tmp[MAX_BOARD_WIDTH * MAX_BOARD_HEIGHT];
 
   swap_types(selected_gem_idx, second_selected_idx);
   game.moves_left--;
 
+  // version 0: always swap
   if (game.version == 0)
   {
     handle_matches(true);
   }
   else
+  // version 1: only let swap go through if it creates a match
   {
-    /* only valid swaps */
     if (find_matches(tmp))
     {
       handle_matches(true);
     }
     else
     {
+      // rollback if no match was found
       swap_types(selected_gem_idx, second_selected_idx);
       game.moves_left++;
     }
@@ -441,6 +436,8 @@ void swap_gems(void)
   update_selection();
 }
 
+// init the gems
+// this is done randomly until there are a board without matches is found. This is not the most effective way but looks like a cool "init animation" so i kept it like this
 void init_gems(void)
 {
   bool has_matches;
@@ -456,17 +453,13 @@ void init_gems(void)
 
     has_matches = find_matches(matches_buffer);
 
-    // Optional: show init process
     M5.Lcd.clear();
     draw_board();
     delay(30);
   } while (has_matches);
 }
 
-// -----------------------------------------------------------------------------
-// Level / Victory (kept from your structure)
-// -----------------------------------------------------------------------------
-
+// when player completes level with height of 3 the game is won. This because with a height of 2 only horizontal matches are possible which is a lot harder
 void show_victory_screen()
 {
   M5.Lcd.fillScreen(BLUE);
@@ -475,28 +468,18 @@ void show_victory_screen()
   M5.Lcd.drawCenterString("YOU WIN!", M5.Lcd.width() / 2, 80);
 
   M5.Lcd.setTextSize(1);
-  M5.Lcd.drawCenterString(String("Final Score: ") + String(game.score), M5.Lcd.width() / 2, 150);
-  M5.Lcd.drawCenterString("Press A+B to Restart", M5.Lcd.width() / 2, 180);
-
-  while (true)
-  {
-    M5.update();
-    if (M5.BtnA.wasPressed() && M5.BtnB.wasPressed())
-    {
-      game.score = 0;
-      init_game(&game, 1);
-      return;
-    }
-    delay(10);
-  }
+  M5.Lcd.drawCenterString(String("Total Score: ") + String(game.score), M5.Lcd.width() / 2, 150);
 }
 
+// check if the user needs to progress to the netx level
 void check_level_up()
 {
+  // arbitrary target score per level
   int target_score = game.level * MATCHES_PER_LEVEL * GEM_VALUE;
   if (game.score < target_score)
     return;
 
+  // reduce height by 1 each level since the dimensions needed to change
   int next_height = 11 - (game.level + 1);
   if (next_height < 3)
   {
@@ -522,23 +505,24 @@ void check_level_up()
   M5.Lcd.fillScreen(BLACK);
 }
 
-// -----------------------------------------------------------------------------
-// EEPROM (kept mostly as-is; match logic doesn’t depend on this)
-// -----------------------------------------------------------------------------
-
-u_int8_t encode_gem(Gem g)
+// encoding and decoding based on the techniques seen in WPO 7 + revision in the last WPO
+uint8_t encode_gem(Gem g)
 {
-  u_int8_t encoded = g.type;
-  if (g.is_selected)
-    encoded |= (1 << 7);
+  uint8_t shifted_selected = g.is_selected << 7;
+  uint8_t encoded = shifted_selected | g.type;
   return encoded;
 }
 
-Gem decode_gem(u_int8_t data)
+Gem decode_gem(uint8_t encoded)
 {
-  Gem g;
-  g.is_selected = (data >> 7) & 1;
-  g.type = data & 0x7F;
+  uint8_t bitmask_selected = 0b10000000;
+  uint8_t shifted_selected = encoded & bitmask_selected;
+  bool is_selected = shifted_selected >> 7;
+
+  uint8_t bitmask_type = 0b01111111;
+  uint8_t type = encoded & bitmask_type;
+
+  Gem g = {type, is_selected};
   return g;
 }
 
@@ -551,6 +535,7 @@ void save_to_eeprom(void)
   // since score is a u_int16 it is being split into 2 bytes (u_int8 each)
   // using byte shifting the first and second byte are read separatly
   // seen in several WPOs but "splitting" the u_int16_t was something in which i only succeeded after a lot of trail and error
+  // we are storing the low byte first so this is little endian
   EEPROM.write(3, (u_int8_t)(game.score & 0b11111111));
   EEPROM.write(4, (u_int8_t)((game.score >> 8) & 0b11111111));
   EEPROM.write(5, game.board_width);
@@ -613,6 +598,7 @@ void draw_option_screen(void)
   }
 }
 
+// function to choose which option is exectuted
 void execute_menu_option(void)
 {
   switch (selected_option)
@@ -638,6 +624,8 @@ void execute_menu_option(void)
   }
 }
 
+// tinkered a little bit with some colors and layouts
+// https://docs.m5stack.com/en/arduino/m5gfx/m5gfx_text for the "drawCenterString" function
 void draw_start_screen()
 {
   M5.Lcd.fillScreen(BLACK);
@@ -666,6 +654,7 @@ void draw_start_screen()
   M5.Lcd.drawCenterString("B to start", M5.Lcd.width() / 2, 220);
 }
 
+// main event lop
 void loop()
 {
   M5.update();
